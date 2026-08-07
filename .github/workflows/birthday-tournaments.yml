@@ -21,7 +21,7 @@ jobs:
           python-version: "3.12"
 
       - name: Abhängigkeiten installieren
-        run: pip install requests
+        run: pip install requests beautifulsoup4
 
       - name: Forum prüfen & Turniere erstellen
         env:
