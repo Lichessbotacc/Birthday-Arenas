@@ -10,11 +10,6 @@ Zeit), und postet eine Antwort im Forum-Thread mit dem Link.
 
 State (verarbeitete Post-IDs, letzte Forumsseite) wird in data/state.json
 gespeichert. Der Workflow committet diese Datei nach jedem Lauf zurück.
-
-Hinweis: Das Posten der Forumsantwort nutzt KEINE offizielle Lichess-API
-(die gibt es dafür nicht), sondern das interne Web-Formular. Das ist
-experimentell und kann brechen, falls Lichess sein HTML ändert. Schlägt es
-fehl, wird nur eine Warnung geloggt - das Turnier wird trotzdem erstellt.
 """
 
 import json
@@ -27,6 +22,7 @@ from zoneinfo import ZoneInfo
 from datetime import datetime, timedelta
 
 import requests
+from bs4 import BeautifulSoup, NavigableString
 
 # ---------------------------------------------------------------------------
 # Konfiguration
@@ -57,6 +53,9 @@ MONTHS = {
 }
 MONTH_NAMES_PATTERN = "|".join(sorted(MONTHS.keys(), key=len, reverse=True))
 
+POST_LINK_RE = re.compile(r"^/@/([\w-]+)$")
+PERMALINK_RE = re.compile(r"\?page=\d+#([A-Za-z0-9]+)$")
+
 session = requests.Session()
 session.headers.update({"User-Agent": "darkonteams-birthday-bot"})
 if TOKEN:
@@ -71,6 +70,7 @@ def extract_birthday(text: str):
     """Gibt (month, day) zurück oder None, wenn kein plausibles Datum gefunden wurde."""
     text = text.strip()
 
+    # "25 January", "3rd December"
     m = re.search(
         rf"\b(\d{{1,2}})(?:st|nd|rd|th)?\s+({MONTH_NAMES_PATTERN})[a-z]*\b",
         text, re.IGNORECASE,
@@ -80,6 +80,7 @@ def extract_birthday(text: str):
         if 1 <= day <= 31:
             return month, day
 
+    # "January 25", "Jul 7th"
     m = re.search(
         rf"\b({MONTH_NAMES_PATTERN})[a-z]*\s+(\d{{1,2}})(?:st|nd|rd|th)?\b",
         text, re.IGNORECASE,
@@ -89,18 +90,21 @@ def extract_birthday(text: str):
         if 1 <= day <= 31:
             return month, day
 
+    # Numerisch: 24/01, 8/09, 24-2, 15.07 usw.
     m = re.search(r"\b(\d{1,2})[/.\-](\d{1,2})\b", text)
     if m:
         a, b = int(m.group(1)), int(m.group(2))
-        day_month_valid = 1 <= a <= 31 and 1 <= b <= 12
-        month_day_valid = 1 <= a <= 12 and 1 <= b <= 31
+        day_month_valid = 1 <= a <= 31 and 1 <= b <= 12   # DD/MM
+        month_day_valid = 1 <= a <= 12 and 1 <= b <= 31   # MM/DD
 
         if day_month_valid and not month_day_valid:
             return b, a
         if month_day_valid and not day_month_valid:
             return a, b
         if day_month_valid and month_day_valid:
+            # beides plausibel (z.B. 8/09) -> europäisches Format DD/MM annehmen
             return b, a
+        # beides ungültig (z.B. 67/67) -> kein echtes Datum
 
     return None
 
@@ -122,19 +126,52 @@ def get_max_page(html: str) -> int:
 
 def extract_posts(html: str):
     """
-    [{username, post_id, text}] in Reihenfolge des Auftretens.
-    ANPASSEN HIER, falls Lichess das Forum-HTML mal ändert.
+    Extrahiert [{username, post_id, text}] in Reihenfolge des Auftretens.
+
+    Robuster Ansatz (statt naivem Regex über den ganzen HTML-Text):
+    - Ein echter Post-Header ist ein Link auf /@/USERNAME, DIREKT gefolgt
+      (nächstes <a>-Tag) von einem Link auf .../?page=N#POSTID. Das
+      Muster tritt bei Mentions im Fließtext (z.B. "@DarkOnCrack") nicht
+      auf, weil danach kein Permalink-Link folgt.
+    - <blockquote>-Elemente (zitierte Antworten) werden vorher entfernt,
+      damit ein Datum im zitierten Text nicht fälschlich dem
+      Antwortenden zugeschrieben wird.
     """
-    pattern = re.compile(
-        r'href="/@/([\w-]+)"[\s\S]*?href="[^"]*#([A-Za-z0-9]{6,12})"'
-        r'[\s\S]*?>(?P<text>[\s\S]*?)(?=href="/@/|$)'
-    )
+    soup = BeautifulSoup(html, "html.parser")
+
+    for bq in soup.find_all("blockquote"):
+        bq.decompose()
+
+    all_links = soup.find_all("a", href=True)
+
+    headers = []  # (anchor_tag, username, post_id)
+    for i, a in enumerate(all_links):
+        m = POST_LINK_RE.match(a["href"])
+        if not m:
+            continue
+        username = m.group(1)
+        # Permalink muss das UNMITTELBAR nächste <a>-Tag sein (strikt, um
+        # False Positives bei Mentions im Text zu vermeiden)
+        if i + 1 < len(all_links):
+            pm = PERMALINK_RE.search(all_links[i + 1]["href"])
+            if pm:
+                headers.append((all_links[i + 1], username, pm.group(1)))
+
+    if not headers:
+        return []
+
+    marker = "@@POST_BOUNDARY_MARKER@@"
+    for anchor, _, _ in headers:
+        anchor.insert_after(NavigableString(marker))
+
+    full_text = soup.get_text("\n")
+    chunks = full_text.split(marker)[1:]  # erstes Element = Text vor dem 1. Post
+
     posts = []
-    for m in pattern.finditer(html):
-        raw_text = m.group("text")
-        text = re.sub(r"<[^>]+>", " ", raw_text)
-        text = re.sub(r"\s+", " ", text).strip()
-        posts.append({"username": m.group(1), "post_id": m.group(2), "text": text})
+    for (_, username, post_id), chunk in zip(headers, chunks):
+        text = re.sub(r"\s+", " ", chunk).strip()
+        posts.append({"username": username, "post_id": post_id, "text": text})
+
     return posts
 
 
@@ -193,25 +230,16 @@ def create_tournament(username: str, month: int, day: int) -> dict:
 # ---------------------------------------------------------------------------
 
 def post_forum_reply(message: str) -> bool:
-    """
-    Versucht eine Antwort im Thread zu posten. Gibt True/False zurück,
-    wirft aber nie eine Exception - ein Fehlschlag darf den Rest des
-    Scripts nicht stoppen.
-    """
     try:
-        # 1) Formularseite laden, um das CSRF-Token zu bekommen
         form_res = session.get(FORUM_BASE, timeout=30)
         form_res.raise_for_status()
 
-        csrf_match = re.search(
-            r'name="csrfToken"[^>]*value="([^"]+)"', form_res.text
-        )
+        csrf_match = re.search(r'name="csrfToken"[^>]*value="([^"]+)"', form_res.text)
         if not csrf_match:
             print("   ! Konnte kein CSRF-Token finden, überspringe Forum-Reply.")
             return False
         csrf_token = csrf_match.group(1)
 
-        # 2) Reply absenden
         reply_res = session.post(
             f"{FORUM_BASE}/reply",
             data={"text": message, "csrfToken": csrf_token},
